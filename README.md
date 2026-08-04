@@ -9,6 +9,7 @@
 ## 安装
 
 ```bash
+git clone https://github.com/S1nyer/cclibc.git
 cd cclibc
 sudo ./install.sh
 ```
