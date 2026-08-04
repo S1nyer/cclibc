@@ -83,17 +83,24 @@ def elf_arch(path):
 
 
 def elf_needed(path):
+    """解析 DT_NEEDED。兼容 GNU readelf 与 llvm-readelf 两种输出格式:
+      GNU : 0x... (NEEDED)             Shared library: [libc.so.6]
+      LLVM: 0x... NEEDED               libc.so.6
+    """
     r = sh(["readelf", "-d", path])
     if r.returncode:
         return []
-    return re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", r.stdout)
+    libs = re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", r.stdout)
+    if not libs:
+        libs = re.findall(r"^\s*0x[0-9a-fA-F]+\s+NEEDED\s+(\S+)", r.stdout, re.M)
+    return libs
 
 
 def build_id(path):
     r = sh(["readelf", "-n", path])
     if r.returncode:
         return None
-    m = re.search(r"Build ID:\s*([0-9a-fA-F]{32,})", r.stdout)
+    m = re.search(r"Build ID:\s*(?:0x)?([0-9a-fA-F]{32,})", r.stdout)
     return m.group(1).lower() if m else None
 
 
@@ -472,21 +479,15 @@ def _has_interp(path):
 
 def _is_libc(path):
     """判定是否为 libc 共享库 (而非可执行文件)。
-    旧版 libc 自带 PT_INTERP, 不能仅凭 _has_interp 区分。
-    策略: ET_EXEC → 否; ET_DYN 无 interpreter → 大概率是;
-    ET_DYN 有 interpreter → 用 libc_version 探测 (libc 有版本字符串, PIE 没有)。"""
-    r = sh(["readelf", "-h", path])
-    if r.returncode:
+    用 file 命令 (libmagic) 判类型, 输出跨系统/跨 readelf 实现稳定:
+      libc/共享库 → 'shared object'; PIE/静态可执行文件 → 'executable'。"""
+    f = sh(["file", path]).stdout
+    if "shared object" not in f:
         return False
-    if "EXEC (Executable file)" in r.stdout:
-        return False
-    if "DYN (Shared object file)" not in r.stdout and \
-       "DYN (Position-Independent Executable" not in r.stdout:
-        return False
-    if not _has_interp(path):
+    if libc_version(path):
         return True
-    # ET_DYN + 有 interpreter: libc 2.23 等旧版会走这里
-    return libc_version(path) is not None
+    # 无 interpreter 的共享库 (现代 libc 部分版本) 也算
+    return not _has_interp(path)
 
 
 def cmd_check(argv):
