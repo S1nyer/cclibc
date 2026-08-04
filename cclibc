@@ -1,0 +1,955 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+cclibc — 基于 glibc-all-in-one 的 libc 调试环境一键切换工具
+(灵感来自 xclibc, 面向 glibc-all-in-one v2 目录结构)
+
+核心能力:
+  * switch   : 把一个 ELF 快速切换到某个 glibc 环境 (自动识别 libc 版本)
+  * restore  : 从备份恢复原 ELF
+  * list     : 列出已下载的 libc 环境
+  * download : 下载 libc 环境 (调用 glibc-aio)
+  * compile  : 针对某个 glibc 版本编译程序 (旧 glibc 也能编)
+  * gdb/debug: 生成/执行带正确符号路径的 gdb 调试
+  * fix-dbg  : 为旧版本 debug 包补充 build-id 符号链接 (gdb 调试必需)
+
+依赖: python3 + patchelf + binutils(readelf)  ; 可选 glibc-aio(download)
+"""
+
+import os
+import re
+import sys
+import glob
+import shutil
+import subprocess
+import functools
+import urllib.request
+
+# ----------------------------------------------------------------------------
+# 配置
+# ----------------------------------------------------------------------------
+HOME = os.path.expanduser("~")
+AIO_DIR  = os.environ.get("CCLIBC_AIO",  os.path.join(HOME, "glibc-all-in-one"))
+LIBS_DIR = os.environ.get("CCLIBC_LIBS", os.path.join(AIO_DIR, "libs"))
+DEV_DIR  = os.environ.get("CCLIBC_DEV",  os.path.join(HOME, "cclibc", "dev"))
+
+ARCH_DIRS = {"amd64": "x86_64-linux-gnu", "i386": "i386-linux-gnu"}
+LD_NAMES  = {"amd64": "ld-linux-x86-64.so.2", "i386": "ld-linux.so.2"}
+
+BAK_SUFFIX = ".cclibc.bak"
+
+COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(s, code):
+    return f"\033[{code}m{s}\033[0m" if COLOR else s
+
+
+def info(s): print(_c("[*]", "36"), s)
+def ok(s):   print(_c("[+]", "32"), s)
+def warn(s): print(_c("[!]", "33"), s)
+def err(s):  print(_c("[-]", "31"), s, file=sys.stderr)
+
+
+class UserError(Exception):
+    pass
+
+
+# ----------------------------------------------------------------------------
+# 底层工具
+# ----------------------------------------------------------------------------
+def sh(cmd, check=False, cwd=None):
+    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
+    if check and r.returncode != 0:
+        raise UserError(f"命令执行失败: {' '.join(cmd)}\n{r.stderr.strip()}")
+    return r
+
+
+def elf_arch(path):
+    r = sh(["readelf", "-h", path])
+    if r.returncode:
+        rf = sh(["file", path]).stdout
+        if "x86-64" in rf:
+            return "amd64"
+        if "Intel 80386" in rf or "i386" in rf:
+            return "i386"
+        return None
+    out = r.stdout
+    if re.search(r"Advanced Micro Devices X86-64", out):
+        return "amd64"
+    if re.search(r"Intel 80386", out):
+        return "i386"
+    return None
+
+
+def elf_needed(path):
+    r = sh(["readelf", "-d", path])
+    if r.returncode:
+        return []
+    return re.findall(r"\(NEEDED\)\s+Shared library: \[([^\]]+)\]", r.stdout)
+
+
+def build_id(path):
+    r = sh(["readelf", "-n", path])
+    if r.returncode:
+        return None
+    m = re.search(r"Build ID:\s*([0-9a-fA-F]{32,})", r.stdout)
+    return m.group(1).lower() if m else None
+
+
+def libc_version(path):
+    """从 libc 文件解析出 glibc 版本 (如 '2.23-0ubuntu11.3' 或 '2.35')"""
+    r = sh(["strings", path])
+    text = r.stdout
+    m = re.search(r"GNU C Library \(.*?GLIBC\s+([A-Za-z0-9.+-]+)\)", text)
+    if m:
+        return m.group(1)
+    m = re.search(r"stable release version (\d+\.\d+)", text)
+    if m:
+        return m.group(1)
+    return None
+
+
+# ----------------------------------------------------------------------------
+# 版本比较
+# ----------------------------------------------------------------------------
+def _parse_version(v):
+    """'2.23-0ubuntu11.3' / '2.36-9+deb12u4' / '2.35' → 可比较的元组"""
+    mm = v.split("-")[0]
+    nums = [int(x) for x in mm.split(".")]
+    while len(nums) < 2:
+        nums.append(0)
+    rev = v.split("-", 1)[1] if "-" in v else ""
+    epoch, revparts = 0, []
+    if "ubuntu" in rev:
+        ep, r = rev.split("ubuntu", 1)
+        try:
+            epoch = int(ep)
+        except ValueError:
+            epoch = 0
+        revparts = [int(x) for x in re.split(r"\D+", r) if x != ""]
+    elif "+deb" in rev:
+        ep, r = rev.split("+", 1)
+        try:
+            epoch = int(ep)
+        except ValueError:
+            epoch = 0
+        revparts = [int(x) for x in re.findall(r"\d+", r)]
+    elif rev:
+        parts = re.split(r"\D+", rev)
+        try:
+            epoch = int(parts[0])
+        except (ValueError, IndexError):
+            epoch = 0
+        revparts = [int(x) for x in parts[1:] if x != ""]
+    return (nums[0], nums[1], epoch, tuple(revparts))
+
+
+def _ver_cmp(a, b):
+    ka, kb = _parse_version(a), _parse_version(b)
+    n = max(len(ka), len(kb))
+    ka = list(ka) + [0] * (n - len(ka))
+    kb = list(kb) + [0] * (n - len(kb))
+    if ka == kb:
+        return 0
+    return -1 if ka < kb else 1
+
+
+def _pick_best(vids):
+    return sorted(vids, key=functools.cmp_to_key(_ver_cmp))[-1]
+
+
+# ----------------------------------------------------------------------------
+# 环境解析
+# ----------------------------------------------------------------------------
+def installed_envs(arch=None):
+    if not os.path.isdir(LIBS_DIR):
+        return []
+    out = []
+    for d in sorted(os.listdir(LIBS_DIR)):
+        if not os.path.isdir(os.path.join(LIBS_DIR, d)):
+            continue
+        if "_" not in d:
+            continue
+        _vid, a = d.rsplit("_", 1)
+        if arch and a != arch:
+            continue
+        out.append(d)
+    return out
+
+
+def _finalize_env(env_id):
+    """env_id 形如 '2.23-0ubuntu11.3_amd64' → 返回环境信息 dict"""
+    env_dir = os.path.join(LIBS_DIR, env_id)
+    if not os.path.isdir(env_dir):
+        raise UserError(f"环境不存在: {env_id} ({env_dir})")
+    a = env_id.rsplit("_", 1)[1]
+    archdir = ARCH_DIRS.get(a)
+    if not archdir:
+        raise UserError(f"未知架构后缀: {env_id}")
+    libdir = os.path.join(env_dir, archdir)
+    if not os.path.isdir(libdir):
+        raise UserError(f"{env_id} 缺少库目录 {archdir}/ (不是有效的 libc 环境)")
+    ld = LD_NAMES.get(a)
+    if not os.path.exists(os.path.join(libdir, ld)):
+        cands = sorted(glob.glob(os.path.join(libdir, "ld-*.so")) +
+                       glob.glob(os.path.join(libdir, "ld-linux*")))
+        if not cands:
+            raise UserError(f"{libdir} 中找不到动态链接器")
+        ld = os.path.basename(cands[0])
+    return {"id": env_id, "arch": a, "arch_dir": archdir,
+            "env_dir": env_dir, "libdir": libdir, "ld": ld}
+
+
+def _pick_env(vid, arch):
+    envs = installed_envs(arch)
+    if not envs:
+        raise UserError(
+            f"libs 目录 ({LIBS_DIR}) 没有下载任何 {arch} 版本, 先执行: cclibc download <版本>")
+    is_bare_major = "-" not in vid and "_" not in vid
+    exact = f"{vid}_{arch}"
+    if not is_bare_major and exact in envs:
+        ok(f"精确匹配环境: {exact}")
+        return _finalize_env(exact)
+    major = vid.split("-")[0]
+    cands = [e for e in envs if e.split("-")[0] == major]
+    if cands:
+        best = _pick_best([e.split("_")[0] for e in cands])
+        best_env = f"{best}_{arch}"
+        if not is_bare_major:
+            warn(f"精确版本 {vid} 未下载, 使用最接近的 {best_env}")
+        else:
+            ok(f"选择 {major} 系列的最新环境: {best_env}")
+        return _finalize_env(best_env)
+    avail = ", ".join(e.split("_")[0] for e in envs)
+    raise UserError(f"未找到 {major} 系列的 {arch} 环境; 已下载: {avail}")
+
+
+def resolve_env(target, arch=None):
+    """把用户输入解析成环境 dict。
+    支持: libc 文件路径 / 环境目录 / '2.23-0ubuntu11.3_amd64' / '2.23-0ubuntu11.3' / '2.23'"""
+    target = target.strip()
+
+    # A. 是文件 → 视为 libc, 自动识别版本
+    if os.path.isfile(target):
+        tarch = elf_arch(target) or arch
+        if not tarch:
+            raise UserError(f"无法识别文件架构: {target}")
+        vid = libc_version(target)
+        if not vid:
+            raise UserError(f"无法从 {target} 识别 glibc 版本号")
+        info(f"目标 libc 版本: {vid} ({tarch})")
+        return _pick_env(vid, tarch)
+
+    # B. 是目录
+    if os.path.isdir(target):
+        base = os.path.basename(os.path.normpath(target))
+        # libs/<id> 目录
+        if os.path.exists(os.path.join(target, ARCH_DIRS["amd64"])) or \
+           os.path.exists(os.path.join(target, ARCH_DIRS["i386"])):
+            if base in installed_envs():
+                return _finalize_env(base)
+            # 可能是自定义目录但结构相同
+            a = "amd64" if os.path.exists(os.path.join(target, ARCH_DIRS["amd64"])) else "i386"
+            return {"id": base, "arch": a, "arch_dir": ARCH_DIRS[a],
+                    "env_dir": target,
+                    "libdir": os.path.join(target, ARCH_DIRS[a]),
+                    "ld": LD_NAMES[a]}
+        # <id>/<arch> 库目录
+        parent = os.path.basename(os.path.dirname(os.path.normpath(target)))
+        if "_" in parent and parent in installed_envs():
+            return _finalize_env(parent)
+        raise UserError(f"无法从目录解析环境: {target}")
+
+    # C. 带架构的完整 id
+    m = re.fullmatch(r"(.+)_(amd64|i386)", target)
+    if m:
+        return _finalize_env(target)
+
+    # D. 完整 id 或主版本号
+    if re.fullmatch(r"\d+\.\d+.*", target):
+        a = arch or "amd64"
+        return _pick_env(target.split("_")[0], a)
+
+    raise UserError(f"无法解析目标: {target}")
+
+
+# ----------------------------------------------------------------------------
+# patch / restore
+# ----------------------------------------------------------------------------
+def _patch_transitive(libdir, needed):
+    """给目标目录里有依赖的库补上 RUNPATH, 处理 pre-2.34 多库互相依赖的情况"""
+    done = set()
+
+    def visit(base, depth=0):
+        if base in done or depth > 3:
+            return
+        p = os.path.join(libdir, base)
+        if not os.path.isfile(p) or base.startswith("ld-linux"):
+            return
+        if elf_arch(p) is None:
+            return
+        subs = elf_needed(p)
+        subs = [s for s in subs if not os.path.basename(s).startswith("ld-linux")]
+        if subs and base not in done:
+            sh(["patchelf", "--set-rpath", libdir, p])
+            done.add(base)
+        for s in subs:
+            visit(os.path.basename(s), depth + 1)
+
+    for n in needed:
+        b = os.path.basename(n)
+        if not b.startswith("ld-linux"):
+            visit(b)
+
+
+def patch_binary(elf, env, replace_needed=False, backup=True):
+    libdir = env["libdir"]
+    if not os.path.isfile(elf):
+        raise UserError(f"ELF 文件不存在: {elf}")
+    if elf_arch(elf) != env["arch"]:
+        raise UserError(
+            f"架构不匹配: {elf} 是 {elf_arch(elf)}, 环境 {env['id']} 是 {env['arch']}")
+
+    bak = elf + BAK_SUFFIX
+    if backup and not os.path.exists(bak):
+        shutil.copy2(elf, bak)
+        info(f"已备份原文件 → {bak}")
+
+    ldpath = os.path.join(libdir, env["ld"])
+    sh(["patchelf", "--set-interpreter", ldpath, elf], check=True)
+    ok(f"interpreter → {ldpath}")
+
+    if replace_needed:
+        sh(["patchelf", "--set-rpath", libdir, elf], check=True)
+        ok(f"RUNPATH → {libdir}")
+        for need in elf_needed(elf):
+            base = os.path.basename(need)
+            if base.startswith("ld-linux"):
+                continue
+            src = os.path.join(libdir, base)
+            if os.path.exists(src):
+                sh(["patchelf", "--replace-needed", need, src, elf])
+                ok(f"replace-needed {need} → {src}")
+            else:
+                warn(f"缺失依赖 {base}, 跳过")
+    else:
+        sh(["patchelf", "--set-rpath", libdir, elf], check=True)
+        ok(f"RUNPATH → {libdir}")
+        _patch_transitive(libdir, elf_needed(elf))
+
+    fix_dbg(env)  # 静默补 build-id 条目 (debug-file-directory 路径用)
+    created, total = bind_dbg(env)  # 核心绑定: libc 同目录 .debug/ 符号链接
+    if total:
+        extra = f", 新建 {created} 个" if created else ""
+        ok(f"调试符号已绑定 ({total} 个库{extra})")
+    else:
+        warn("该环境未找到可绑定的调试符号")
+
+    print()
+    ok(f"切换完成: {elf} → {env['id']}")
+    return bak
+
+
+def debuglink_target(path):
+    """解析 ELF 的 .gnu_debuglink 段目标文件名 (如 'libc-2.23.so' 或 build-id 串)。
+    现代 Ubuntu 的 debuglink 名是纯 hex 串, 不能用 ASCII 列解析, 需重建字节。"""
+    r = sh(["readelf", "-x", ".gnu_debuglink", path])
+    if r.returncode:
+        return None
+    hexbuf = []
+    for line in r.stdout.splitlines():
+        m = re.match(r"\s*0x[0-9a-f]+\s+((?:[0-9a-f]{8}\s+)*)", line)
+        if m:
+            hexbuf.append(m.group(1).replace(" ", ""))
+    if not hexbuf:
+        return None
+    data = bytes.fromhex("".join(hexbuf))
+    name = bytearray()
+    for b in data:
+        if b == 0 or b < 0x20 or b > 0x7e:  # NUL / 非可打印 → 名字结束
+            break
+        name.append(b)
+    name = name.decode(errors="ignore")
+    if name and re.fullmatch(r"[A-Za-z0-9._+-]+", name):
+        return name
+    return None
+
+
+def bind_dbg(env):
+    """在 libc 运行目录下建 .debug/ 符号链接, 使 gdb/pwndbg 默认搜索路径
+    (libc 同目录 .debug/ + .gnu_debuglink) 即可找到调试符号, 无需任何额外参数。
+    返回 (新建数, 应绑定总数)。"""
+    libdir = env["libdir"]
+    srcdir = os.path.join(env["env_dir"], ".debug", env["arch_dir"])
+    biddir = os.path.join(env["env_dir"], ".debug", ".build-id")
+    out = os.path.join(libdir, ".debug")
+    os.makedirs(out, exist_ok=True)
+    created, total = 0, 0
+    seen = set()
+    for f in sorted(os.listdir(libdir)):
+        if not re.search(r"\.so(\.\d+)*$", f):  # libc.so.6 / libc-2.23.so / libmemusage.so
+            continue
+        lib = os.path.join(libdir, f)
+        if not os.path.isfile(lib) or elf_arch(lib) is None:
+            continue
+        t = debuglink_target(lib)
+        if not t:
+            continue
+        # 定位 debug 文件: 直接文件 → build-id 条目
+        debug_file = None
+        direct = os.path.join(srcdir, os.path.basename(f))
+        if os.path.isfile(direct):
+            debug_file = direct
+        else:
+            bid = build_id(lib)
+            if bid:
+                bf = os.path.join(biddir, bid[:2], bid[2:] + ".debug")
+                if os.path.isfile(bf):
+                    debug_file = bf
+        if not debug_file:
+            continue
+        link = os.path.join(out, t)
+        if link in seen:  # 同名符号链接(如 libc.so.6 与 libc-2.23.so)只计一次
+            continue
+        seen.add(link)
+        total += 1
+        if os.path.exists(link):
+            continue
+        try:
+            os.symlink(debug_file, link)
+            created += 1
+        except OSError as e:
+            warn(f"绑定失败 {link}: {e}")
+    return created, total
+
+
+def fix_dbg(env):
+    """旧版本 debug 包可能没有 build-id 条目, 从直接 debug 文件补建符号链接。
+    这样 gdb 的 `set debug-file-directory <env>/.debug` 才能找到符号。"""
+    direct = os.path.join(env["env_dir"], ".debug", env["arch_dir"])
+    biddir = os.path.join(env["env_dir"], ".debug", ".build-id")
+    created = 0
+    if not os.path.isdir(direct):
+        return 0
+    for f in os.listdir(direct):
+        if not f.endswith(".so"):
+            continue
+        p = os.path.join(direct, f)
+        bid = build_id(p)
+        if not bid:
+            continue
+        sub = os.path.join(biddir, bid[:2])
+        try:
+            os.makedirs(sub, exist_ok=True)
+            link = os.path.join(sub, bid[2:] + ".debug")
+            if not os.path.exists(link):
+                os.symlink(p, link)
+                created += 1
+        except OSError as e:
+            warn(f"建立符号链接失败 {link}: {e}")
+    return created
+
+
+def restore(elf):
+    bak = elf + BAK_SUFFIX
+    if os.path.exists(bak):
+        shutil.copy2(bak, elf)
+        os.remove(bak)
+        ok(f"已从 {bak} 恢复 {elf}, 并删除备份")
+    else:
+        warn(f"未找到备份 {bak}")
+
+
+# ----------------------------------------------------------------------------
+# 检查 / 信息
+# ----------------------------------------------------------------------------
+def _has_interp(path):
+    """ET_EXEC 或 PIE 可执行文件有 PT_INTERP; 共享库则没有"""
+    r = sh(["readelf", "-l", path])
+    return bool(re.search(r"Requesting program interpreter:\s*[^\]\n]+", r.stdout))
+
+
+def _is_libc(path):
+    """判定是否为 libc 共享库 (而非可执行文件)。
+    旧版 libc 自带 PT_INTERP, 不能仅凭 _has_interp 区分。
+    策略: ET_EXEC → 否; ET_DYN 无 interpreter → 大概率是;
+    ET_DYN 有 interpreter → 用 libc_version 探测 (libc 有版本字符串, PIE 没有)。"""
+    r = sh(["readelf", "-h", path])
+    if r.returncode:
+        return False
+    if "EXEC (Executable file)" in r.stdout:
+        return False
+    if "DYN (Shared object file)" not in r.stdout and \
+       "DYN (Position-Independent Executable" not in r.stdout:
+        return False
+    if not _has_interp(path):
+        return True
+    # ET_DYN + 有 interpreter: libc 2.23 等旧版会走这里
+    return libc_version(path) is not None
+
+
+def cmd_check(argv):
+    path = argv[0]
+    if not os.path.isfile(path):
+        raise UserError(f"文件不存在: {path}")
+    arch = elf_arch(path)
+    if not arch:
+        raise UserError(f"无法识别 {path} 的架构 (不是 ELF 文件?)")
+
+    # 共享库 → info 模式
+    if _is_libc(path):
+        vid = libc_version(path)
+        bid = build_id(path)
+        print(f"文件    : {path}")
+        print(f"架构    : {arch}")
+        print(f"版本    : {vid}")
+        print(f"BuildID : {bid}")
+        if vid:
+            emajor = vid.split("-")[0]
+            a = arch or "amd64"
+            for e in installed_envs(a):
+                eid = e.split("_")[0]
+                if eid.split("-")[0] == emajor:
+                    exact = "精确" if eid == vid else "近似"
+                    ok(f"已下载的{exact}环境: {e}")
+        return 0
+
+    # 可执行文件 → check 模式
+    print(f"ELF      : {path} ({arch})")
+
+    interp = None
+    r = sh(["readelf", "-l", path])
+    m = re.search(r"Requesting program interpreter:\s*([^\]\n]+)\]?", r.stdout)
+    if m:
+        interp = m.group(1).rstrip("]")
+        print(f"Interpreter : {interp}")
+
+    runpath = None
+    r = sh(["readelf", "-d", path])
+    m = re.search(r"\((?:RPATH|RUNPATH)\)\s+Library runpath:\s*\[([^\]]+)\]", r.stdout)
+    if m:
+        runpath = m.group(1)
+        print(f"RPATH/RUNPATH: {runpath}")
+
+    print("NEEDED    : " + ", ".join(elf_needed(path)) or "(无)")
+
+    if interp:
+        for e in installed_envs():
+            if interp.startswith(os.path.join(LIBS_DIR, e)):
+                ok(f"→ 当前环境: {e}")
+                return 0
+        if runpath and LIBS_DIR in runpath:
+            info("→ 当前环境: 由 glibc-all-in-one 提供 (非标准环境)")
+        else:
+            info("→ 当前未使用 glibc-all-in-one 环境")
+    return 0
+
+
+def cmd_list(argv):
+    envs = installed_envs()
+    if not envs:
+        warn(f"{LIBS_DIR} 下没有已下载的 libc 环境")
+        info(f"提示: 先运行 glibc-aio mirror update, 然后 cclibc download <版本>")
+        return 0
+    print(_c("已下载的 libc 环境:", "36"))
+    for e in envs:
+        arch = e.rsplit("_", 1)[1]
+        print(f"  {e}")
+    print()
+    print(f"共 {len(envs)} 个环境, 目录: {LIBS_DIR}")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# 下载
+# ----------------------------------------------------------------------------
+def cmd_download(argv):
+    version = argv[0] if argv else None
+    if not version:
+        cmd_list([])
+        return 0
+    # 展开主版本号到具体 id
+    listfile = os.path.join(AIO_DIR, "list")
+    ids = []
+    if os.path.exists(listfile):
+        for line in open(listfile):
+            v = line.strip()
+            if not v or v == "[old]":
+                continue
+            if v.startswith(version):
+                ids.append(v)
+    # 完整 id (带 _amd64/_i386 后缀) 即使不在 list 里也允许直接下载
+    if not ids and re.fullmatch(r".+_(amd64|i386)", version):
+        ids = [version]
+    # 已下载的直接跳过
+    todo = [v for v in ids if not os.path.isdir(os.path.join(LIBS_DIR, v))]
+    if not ids:
+        err(f"在 {listfile} 中找不到 '{version}' (先运行: glibc-aio mirror update)")
+        return 1
+    if not todo:
+        ok("这些版本已全部下载")
+        return 0
+
+    # 多版本: 交互选择或全部下载
+    if len(todo) > 1:
+        if sys.stdin.isatty():
+            print("匹配到多个版本:")
+            for i, v in enumerate(todo):
+                print(f"  [{i}] {v}")
+            sel = input("输入序号下载 (回车=全部): ").strip()
+            if sel.isdigit() and 0 <= int(sel) < len(todo):
+                todo = [todo[int(sel)]]
+            elif sel == "":
+                pass
+            else:
+                warn("输入无效, 下载全部")
+        else:
+            info(f"下载 {len(todo)} 个版本")
+
+    if shutil.which("glibc-aio") is None:
+        raise UserError(
+            "找不到 glibc-aio 命令 (pip 安装失败?)\n"
+            f"  手动安装: cd {AIO_DIR} && pip install --break-system-packages -e .")
+    for v in todo:
+        info(f"下载 {v} ...")
+        r = subprocess.run(["glibc-aio", "download", v], cwd=AIO_DIR)
+        if r.returncode != 0:
+            warn(f"{v} 下载失败 (glibc-aio 退出码 {r.returncode})")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# gdb 辅助
+# ----------------------------------------------------------------------------
+def _gdb_cmds(env):
+    return (f"set solib-search-path {env['libdir']}",
+            f"set debug-file-directory {env['env_dir']}/.debug")
+
+
+def cmd_gdb(argv):
+    elf = argv[0]
+    if not os.path.isfile(elf):
+        raise UserError(f"文件不存在: {elf}")
+    interp = None
+    r = sh(["readelf", "-l", elf])
+    m = re.search(r"Requesting program interpreter:\s*([^\]\n]+)\]?", r.stdout)
+    if not m:
+        raise UserError(f"无法确定 {elf} 的动态链接器, 请先 cclibc switch")
+    interp = m.group(1).rstrip("]")
+    env = None
+    for e in installed_envs():
+        if interp.startswith(os.path.join(LIBS_DIR, e)):
+            env = _finalize_env(e)
+            break
+    if not env:
+        raise UserError(f"{elf} 未使用 glibc-all-in-one 环境, 请先 cclibc switch")
+    ok(f"{elf} → 环境 {env['id']}")
+    print()
+    print("直接在 gdb 里执行:")
+    for cmd in _gdb_cmds(env):
+        print(f"  {cmd}")
+    print()
+    print("或直接启动 (等价于 cclibc debug):")
+    print(f'  pwndbg -q -ex "{_gdb_cmds(env)[0]}" -ex "{_gdb_cmds(env)[1]}" -- {elf}')
+    return 0
+
+
+def _resolve_elf_env(elf):
+    """依据 ELF 的 interpreter 路径定位它当前使用的 cclibc 环境"""
+    if not os.path.isfile(elf):
+        raise UserError(f"文件不存在: {elf}")
+    r = sh(["readelf", "-l", elf])
+    m = re.search(r"Requesting program interpreter:\s*([^\]\n]+)\]?", r.stdout)
+    if not m:
+        raise UserError(f"无法确定 {elf} 的动态链接器, 请先 cclibc switch")
+    interp = m.group(1).rstrip("]")
+    for e in installed_envs():
+        if interp.startswith(os.path.join(LIBS_DIR, e)):
+            return _finalize_env(e)
+    raise UserError(f"{elf} 未使用 glibc-all-in-one 环境, 请先 cclibc switch")
+
+
+def cmd_debug(argv, debugger="pwndbg"):
+    elf = argv[0]
+    env = _resolve_elf_env(elf)
+    gdb_cmds = _gdb_cmds(env)
+    info(f"启动 {debugger} 调试 {elf} (环境 {env['id']}) ...")
+    cmd = [debugger, "-q",
+           "-ex", gdb_cmds[0],
+           "-ex", gdb_cmds[1],
+           "--", elf] + argv[1:]
+    os.execvp(debugger, cmd)
+    return 0
+
+
+def cmd_run(argv):
+    elf = argv[0]
+    if not os.path.isfile(elf):
+        raise UserError(f"文件不存在: {elf}")
+    info(f"运行 {elf} ...")
+    os.execvpe(elf, [elf] + argv[1:], os.environ)
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# 针对旧 glibc 编译
+# ----------------------------------------------------------------------------
+def _gcc_toolchain():
+    inc = sh(["gcc", "-print-file-name=include"]).stdout.strip()
+    inc_fixed = sh(["gcc", "-print-file-name=include-fixed"]).stdout.strip()
+    libgcc = sh(["gcc", "-print-libgcc-file-name"]).stdout.strip()
+    gccdir = os.path.dirname(libgcc)
+    if not os.path.isabs(inc_fixed):
+        inc_fixed = os.path.join(gccdir, inc_fixed)
+    # 只保留真实存在的目录, 避免传相对/不存在的 include-fixed
+    incs = [d for d in (inc, inc_fixed) if d and os.path.isdir(d)]
+    return incs, gccdir
+
+
+def _ensure_dev(env, force=False):
+    """下载并解包 libc6-dev, 修正链接脚本, 返回 dev 目录"""
+    dev = os.path.join(DEV_DIR, env["id"])
+    if os.path.isdir(os.path.join(dev, "usr", "include")) and not force:
+        return dev
+    archdir = env["arch_dir"]
+    deb = f"libc6-dev_{env['id']}.deb"
+    url = f"https://mirror.tuna.tsinghua.edu.cn/ubuntu/pool/main/g/glibc/{deb}"
+    os.makedirs(DEV_DIR, exist_ok=True)
+    deb_path = os.path.join(DEV_DIR, deb)
+    info(f"下载 dev 包: {url}")
+    try:
+        urllib.request.urlretrieve(url, deb_path)
+    except Exception as e:
+        raise UserError(f"下载 {deb} 失败: {e}")
+    info("解包 ...")
+    tmp = deb_path + ".x"
+    if os.path.isdir(tmp):
+        shutil.rmtree(tmp)
+    os.makedirs(tmp)
+    sh(["ar", "x", deb_path], cwd=tmp, check=True)
+    data = glob.glob(os.path.join(tmp, "data.tar.*"))[0]
+    if data.endswith(".zst"):
+        sh(["tar", "-I", "zstd", "-xf", data], cwd=tmp, check=True)
+    else:
+        sh(["tar", "-xf", data], cwd=tmp, check=True)
+    shutil.rmtree(dev, ignore_errors=True)
+    os.makedirs(dev)
+    shutil.copytree(os.path.join(tmp, "usr"), os.path.join(dev, "usr"),
+                    symlinks=True)
+    shutil.rmtree(tmp)
+    os.remove(deb_path)
+    # 修正 libc.so 链接脚本, 指向运行时环境
+    script = os.path.join(dev, "usr", "lib", archdir, "libc.so")
+    if os.path.exists(script):
+        ldpath = os.path.join(env["libdir"], env["ld"])
+        libc_runtime = os.path.join(env["libdir"], "libc.so.6")
+        nonshared = os.path.join(dev, "usr", "lib", archdir, "libc_nonshared.a")
+        with open(script, "w") as f:
+            f.write("/* GNU ld script (fixed by cclibc) */\n")
+            f.write(f"GROUP ( {libc_runtime} {nonshared} "
+                    f"AS_NEEDED ( {ldpath} ) )\n")
+        ok(f"已修正链接脚本 {script}")
+    return dev
+
+
+def cmd_compile(argv):
+    src = argv[0]
+    if not os.path.isfile(src):
+        raise UserError(f"源文件不存在: {src}")
+    version = argv[1] if len(argv) > 1 else None
+    arch = "amd64"
+    out = None
+    rest = argv[2:]
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        if a in ("-o", "--output"):
+            out = rest[i + 1]
+            i += 2
+        elif a in ("-m32", "--arch"):
+            nxt = "i386" if a == "-m32" else rest[i + 1]
+            arch = nxt
+            i += 2 if a != "-m32" else 1
+        else:
+            i += 1
+    if not version:
+        envs = installed_envs(arch)
+        if not envs:
+            raise UserError("没有已下载的环境, 请指定版本: cclibc compile <src> <版本>")
+        version = envs[-1]
+    out = out or os.path.splitext(os.path.basename(src))[0]
+    info(f"解析环境 {version} ({arch}) ...")
+    env = resolve_env(version, arch)
+    dev = _ensure_dev(env)
+
+    inc_dirs, libgcc_dir = _gcc_toolchain()
+    archdir = env["arch_dir"]
+    dev_lib = os.path.join(dev, "usr", "lib", archdir)
+    dev_inc = os.path.join(dev, "usr", "include")
+
+    cmd = ["gcc", "-o", out, src, "-nostdlib", "-nostdinc"]
+    if arch == "i386":
+        cmd.append("-m32")
+    cmd += [os.path.join(dev_lib, "crt1.o"),
+            os.path.join(dev_lib, "crti.o")]
+    cmd += [f"-I{dev_inc}",
+            f"-I{os.path.join(dev_inc, archdir)}"]
+    for d in inc_dirs:
+        cmd += ["-isystem", d]
+    cmd += [f"-L{dev_lib}",
+            f"-L{libgcc_dir}",
+            "-Wl,--hash-style=sysv", "-no-pie",
+            f"-Wl,--dynamic-linker,{os.path.join(env['libdir'], env['ld'])}",
+            f"-Wl,-rpath,{env['libdir']}"]
+    if arch == "i386":
+        cmd.append("-Wl,-m,elf_i386")
+    cmd += ["-lc", "-lgcc", "-lgcc_eh", "-lgcc",
+            os.path.join(dev_lib, "crtn.o")]
+
+    info("编译命令:")
+    print("  " + " ".join(cmd))
+    r = subprocess.run(cmd)
+    if r.returncode != 0:
+        warn("编译失败")
+        return r.returncode
+    ok(f"编译成功: {out} (glibc {env['id']})")
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# switch
+# ----------------------------------------------------------------------------
+def cmd_switch(argv):
+    elf = argv[0]
+    if not os.path.isfile(elf):
+        raise UserError(f"ELF 文件不存在: {elf}")
+    arch = elf_arch(elf)
+    if not arch:
+        raise UserError(f"无法识别 {elf} 的架构 (ELF 文件?)")
+
+    opts = {"replace_needed": False, "backup": True}
+    targets = []
+    for a in argv[1:]:
+        if a in ("-n", "--replace-needed"):
+            opts["replace_needed"] = True
+        elif a == "--no-backup":
+            opts["backup"] = False
+        elif a.startswith("--arch="):
+            arch = a.split("=", 1)[1]
+        else:
+            targets.append(a)
+
+    if not targets:
+        raise UserError("用法: cclibc switch <elf> <libc文件|版本号|环境目录> [-n]")
+
+    info(f"ELF: {elf} ({arch})")
+    env = resolve_env(targets[0], arch)
+    patch_binary(elf, env, replace_needed=opts["replace_needed"],
+                 backup=opts["backup"])
+    return 0
+
+
+# ----------------------------------------------------------------------------
+# 主入口
+# ----------------------------------------------------------------------------
+USAGE = """\
+cclibc — glibc 调试环境一键切换工具 (基于 glibc-all-in-one)
+
+用法:
+  cclibc switch <elf> <目标> [-n]     一键切换 libc 环境
+        <目标> = libc 文件 (自动识别版本) | 版本号 (2.35 / 2.35-0ubuntu3.14) | 环境目录
+        -n / --replace-needed          用 replace-needed 方式修改 (替代 rpath)
+  cclibc restore <elf>                 从备份恢复原文件
+  cclibc check <elf>                   查看 ELF 环境 / libc 版本信息
+  cclibc list                          列出已下载的 libc 环境
+  cclibc download <版本>               下载 libc 环境 (调用 glibc-aio)
+  cclibc compile <源码.c> [版本] [-o out] [--arch amd64|i386]   针对旧 glibc 编译
+  cclibc gdb <elf>                     打印该 ELF 的 gdb 调试命令
+  cclibc debug <elf> [参数...]         用 pwndbg 启动调试 (自动绑定符号)
+  cclibc run <elf> [参数...]           直接运行 (使用切换后的 libc)
+  cclibc fix-dbg <版本>                补建调试符号 (build-id + 库目录绑定)
+
+简写:  cclibc <elf>            == cclibc check <elf>
+       cclibc <elf> <目标>     == cclibc switch <elf> <目标>
+
+环境变量:
+  CCLIBC_AIO   glibc-all-in-one 目录 (默认 ~/glibc-all-in-one)
+  CCLIBC_LIBS  libs 目录 (默认 <AIO>/libs)
+  CCLIBC_DEV   dev 包存放目录 (默认 ~/cclibc/dev)
+"""
+
+
+def main(argv):
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if argv[0] in ("-v", "--version"):
+        print("cclibc v1.0")
+        return 0
+
+    cmd = argv[0]
+    sub_cmds = {"switch", "restore", "list", "download",
+                "gdb", "debug", "run", "check", "fix-dbg", "compile"}
+    if cmd in sub_cmds:
+        args = argv[1:]
+    else:
+        # 简写: cclibc <elf> [目标]
+        if not os.path.exists(cmd):
+            if "/" in cmd or cmd.startswith("."):
+                err(f"文件不存在: {cmd}")
+            else:
+                err(f"未知命令: {cmd}")
+                print(USAGE)
+            return 1
+        if len(argv) >= 2:
+            return cmd_switch([cmd] + argv[1:])
+        return cmd_check([cmd])
+
+    try:
+        if cmd == "switch":
+            return cmd_switch(args)
+        if cmd == "restore":
+            return restore(args[0])
+        if cmd == "list":
+            return cmd_list(args)
+        if cmd == "download":
+            return cmd_download(args)
+        if cmd == "gdb":
+            return cmd_gdb(args)
+        if cmd == "debug":
+            return cmd_debug(args)
+        if cmd == "run":
+            return cmd_run(args)
+        if cmd == "check":
+            return cmd_check(args)
+        if cmd == "fix-dbg":
+            env = resolve_env(args[0])
+            fix_dbg(env)
+            created, total = bind_dbg(env)
+            if total:
+                if created:
+                    ok(f"为 {env['id']} 绑定调试符号: 新建 {created} 个, 共 {total} 个库")
+                else:
+                    ok(f"{env['id']} 的调试符号绑定已就绪 ({total} 个库)")
+            else:
+                warn(f"{env['id']} 未找到可绑定的调试符号")
+            return 0
+        if cmd == "compile":
+            return cmd_compile(args)
+    except UserError as e:
+        err(str(e))
+        return 1
+    except IndexError:
+        err("缺少参数, 用法见: cclibc -h")
+        return 1
+    except FileNotFoundError as e:
+        err(f"缺少外部命令: {e.filename} (请先安装依赖)")
+        return 1
+    except KeyboardInterrupt:
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
