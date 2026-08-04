@@ -12,7 +12,13 @@
 set -euo pipefail
 
 CCLIBC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-AIO_DIR="${CCLIBC_AIO:-$HOME/glibc-all-in-one}"
+
+# sudo 运行时 $HOME=/root, 必须用真实用户的家目录, 否则 glibc-all-in-one
+# 会装到 /root 下 (属主 root, 普通用户无法读写, pip editable 也会失效)
+REAL_USER="${SUDO_USER:-$USER}"
+REAL_HOME="$(getent passwd "$REAL_USER" 2>/dev/null | cut -d: -f6)"
+[ -n "$REAL_HOME" ] || REAL_HOME="$HOME"
+AIO_DIR="${CCLIBC_AIO:-$REAL_HOME/glibc-all-in-one}"
 
 # ----------------------------- 颜色 / 输出 -----------------------------
 if [ -t 1 ]; then
@@ -98,15 +104,53 @@ else
 fi
 
 # ----------------------------- 3. glibc-all-in-one + glibc-aio -----------------------------
+# sudo 下 clone/下载的属主是 root, 归还给真实用户, 否则普通用户无法写 libs/
+fix_owner() {
+  if [ "$(stat -c '%U' "$AIO_DIR" 2>/dev/null)" = "root" ] && [ "$REAL_USER" != "root" ]; then
+    chown -R "$REAL_USER" "$AIO_DIR" 2>/dev/null || warn "chown $AIO_DIR 失败 (可手动: sudo chown -R $REAL_USER $AIO_DIR)"
+  fi
+}
+
+clone_aio() {
+  git clone https://github.com/matrix1001/glibc-all-in-one.git "$AIO_DIR" \
+    || die "git clone 失败 (检查网络)"
+  fix_owner
+  ok "glibc-all-in-one 就绪: $AIO_DIR"
+}
+
 if [ ! -d "$AIO_DIR" ]; then
-  if ask_yes "未找到 glibc-all-in-one, 是否 clone 到 $AIO_DIR?" y; then
-    git clone https://github.com/matrix1001/glibc-all-in-one.git "$AIO_DIR" \
-      || die "git clone 失败 (检查网络)"
+  info "未找到 glibc-all-in-one, 开始 clone ..."
+  clone_aio
+elif [ -z "$(ls -A "$AIO_DIR" 2>/dev/null)" ]; then
+  # 有文件夹但是空的 → 视为未初始化, 直接 clone 进去
+  info "$AIO_DIR 是空目录, 开始 clone ..."
+  clone_aio
+elif [ -d "$AIO_DIR/.git" ]; then
+  # 是 git 仓库 → 校验是否 v2 版 (cclibc 依赖 glibc_aio Python 包结构)
+  if [ ! -f "$AIO_DIR/pyproject.toml" ] || [ ! -d "$AIO_DIR/glibc_aio" ]; then
+    warn "$AIO_DIR 是旧版 (v1 shell 脚本) glibc-all-in-one, 与 cclibc 不兼容"
+    if ask_yes "  是否删除并重新 clone (v2)?" y; then
+      rm -rf "$AIO_DIR"
+      clone_aio
+    else
+      die "需要 v2 版 glibc-all-in-one (删除旧目录后重试)"
+    fi
   else
-    die "cclibc 依赖 glibc-all-in-one, 无法继续"
+    ok "glibc-all-in-one 已存在: $AIO_DIR"
+    info "更新 glibc-all-in-one ..."
+    git -C "$AIO_DIR" pull --ff-only \
+      || warn "git pull 失败 (可稍后手动: git -C $AIO_DIR pull)"
+    fix_owner
   fi
 else
-  ok "glibc-all-in-one 已存在: $AIO_DIR"
+  # 有内容但不是 git 仓库 → 目录不完整
+  warn "$AIO_DIR 存在但不是 git 仓库 (内容不完整)"
+  if ask_yes "  是否删除并重新 clone?" y; then
+    rm -rf "$AIO_DIR"
+    clone_aio
+  else
+    die "无法继续: $AIO_DIR 无效"
+  fi
 fi
 
 info "安装 glibc-aio (Python 包) ..."

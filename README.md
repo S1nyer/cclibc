@@ -16,6 +16,8 @@ sudo ./install.sh
 
 流程：检查/安装系统依赖 → glibc-all-in-one + glibc-aio → 软链接 `cclibc` 到 `/usr/local/bin`（PATH 仅此一种方式）→ 询问是否下载 libc
 
+> `sudo ./install.sh` 与 `./install.sh` 均可：脚本自动定位真实用户目录（不会装到 /root），并把 clone/下载的文件属主归还当前用户。
+
 下载 libc 时二选一：
 
 | 模式 | 说明 |
