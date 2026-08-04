@@ -104,12 +104,18 @@ else
 fi
 
 # ----------------------------- 3. glibc-all-in-one + glibc-aio -----------------------------
-# sudo 下 clone/下载的属主是 root, 归还给真实用户, 否则普通用户无法写 libs/
+# sudo 下 clone/下载/pip 的产物属主是 root, 统一归还给真实用户。
+# 条件: 真实用户非 root 且当前以 root 运行 (sudo) → 直接 chown 整个目录,
+# 不能只看顶层属主: 顶层可能是用户 clone 的, 内部却有 sudo 产生的 root 文件。
 fix_owner() {
-  if [ "$(stat -c '%U' "$AIO_DIR" 2>/dev/null)" = "root" ] && [ "$REAL_USER" != "root" ]; then
-    chown -R "$REAL_USER" "$AIO_DIR" 2>/dev/null || warn "chown $AIO_DIR 失败 (可手动: sudo chown -R $REAL_USER $AIO_DIR)"
+  if [ "$REAL_USER" != "root" ] && [ "$(id -u)" = "0" ]; then
+    chown -R "$REAL_USER" "$AIO_DIR" 2>/dev/null \
+      || warn "chown $AIO_DIR 失败 (可手动: sudo chown -R $REAL_USER $AIO_DIR)"
   fi
 }
+# EXIT trap 兜底: mirror update(list)/pip(egg-info)/下载(libs,debs) 都会产生
+# root 文件, 脚本无论正常结束还是出错退出都统一归还属主
+trap 'fix_owner' EXIT
 
 clone_aio() {
   git clone https://github.com/matrix1001/glibc-all-in-one.git "$AIO_DIR" \
